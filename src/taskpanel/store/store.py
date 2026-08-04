@@ -44,6 +44,12 @@ class TaskStore:
             f.write(json.dumps(full, ensure_ascii=False) + "\n")
         return full
 
+    def get_or_none(self, task_id: str) -> Task | None:
+        meta = self.tasks_dir / task_id / "meta.json"
+        if not meta.exists():
+            return None
+        return self._task_from_meta(json.loads(meta.read_text(encoding="utf-8")))
+
     def load_tasks(self) -> list[Task]:
         tasks = []
         for d in self.tasks_dir.iterdir():
