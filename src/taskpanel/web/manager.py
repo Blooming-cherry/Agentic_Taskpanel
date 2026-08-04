@@ -67,8 +67,8 @@ class Manager:
                           use_worktree=False) -> Task:
         task = make_task(kind, prompt, cwd=cwd, use_worktree=use_worktree)
         self.store.save_task(task)
-        if self._sem is not None:
-            await self._sem.acquire()
+        # 信号量在 _dispatch 内获取并释放:create_task 不再持有,消除
+        # acquire 之后、spawn 之前被取消导致的永不释放泄漏窗口。
         asyncio.create_task(self._dispatch(task))
         return task
 
@@ -81,9 +81,13 @@ class Manager:
         return BUILTIN_TOOLS if self._probe_cache[key] else chat_tools()
 
     async def _dispatch(self, task: Task):
-        root = await self._root_for(task)
-        client = build_client(self.cfg.llm)
+        # 信号量在 _dispatch 内获取/释放:入口抛错(如 _root_for /
+        # build_client)或任务中途被取消时,finally 仍会释放,不留泄漏窗口。
+        if self._sem is not None:
+            await self._sem.acquire()
         try:
+            root = await self._root_for(task)
+            client = build_client(self.cfg.llm)
             key = (self.cfg.llm.base_url, self.cfg.llm.model)
             if key not in self._probe_cache:
                 try:
@@ -97,11 +101,15 @@ class Manager:
             self._loops[task.id] = loop
             last_err = None
             for attempt in range(self.cfg.llm.max_retries):
+                snapshot = list(task.messages)
                 try:
                     await loop.run()
                     self.store.save_task(task)
                     return
                 except Exception as e:  # noqa: BLE001 协议/网络错误
+                    # 回滚本次尝试写入的半轮消息(如 tool_use 缺 tool_result),
+                    # 避免下一次 attempt 带着脏上下文重跑。
+                    task.messages[:] = snapshot
                     last_err = e
                     if attempt == 0 and isinstance(client, AnthropicSDKClient):
                         from taskpanel.core.llm_raw import RawHTTPClient
