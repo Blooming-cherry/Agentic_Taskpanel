@@ -175,15 +175,25 @@ class Manager:
         return self._reviews.get(task_id, {"findings": [], "raw": None, "stderr": None})
 
     async def get_context(self, task_id: str, path: str, line: int, context: int = 8) -> dict:
-        """返回锚点行 ±context 行的文件内容,供 diff 预览展开。"""
+        """返回锚点行 ±context 行的文件内容,供 diff 预览展开。
+
+        安全约束: 拒绝绝对路径与 .. 穿越 — 解析后必须仍落在 task 根目录内,
+        越界或读取失败(目录/权限)统一抛 FileNotFoundError → HTTP 404。
+        """
         task = self.get(task_id)
         if not task:
             raise KeyError(task_id)
-        root = Path(task.worktree or task.cwd or ".")
+        root = Path(task.worktree or task.cwd or ".").resolve()
         full = Path(path)
-        if not full.is_absolute():
-            full = root / full
-        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        if full.is_absolute():
+            raise FileNotFoundError("absolute path rejected")
+        full = (root / full).resolve()
+        if not full.is_relative_to(root):
+            raise FileNotFoundError("path escapes task root")
+        try:
+            lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            raise FileNotFoundError(str(full))
         lo, hi = max(0, line - 1 - context), min(len(lines), line + context)
         return {"path": str(full), "start": lo + 1, "lines": lines[lo:hi]}
 

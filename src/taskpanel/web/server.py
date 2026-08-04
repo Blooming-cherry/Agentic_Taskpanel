@@ -84,7 +84,7 @@ def create_app(cfg: PanelConfig) -> FastAPI:
     async def get_context(task_id: str, path: str, line: int, context: int = 8):
         try:
             return await mgr.get_context(task_id, path, line, context)
-        except (KeyError, FileNotFoundError):
+        except (KeyError, FileNotFoundError, OSError):
             raise HTTPException(404, "not found")
 
     @app.get("/api/tasks/{task_id}/events", dependencies=[Depends(auth)])
