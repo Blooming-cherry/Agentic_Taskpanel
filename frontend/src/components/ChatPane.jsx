@@ -24,7 +24,7 @@ export default function ChatPane({ task, events, onEventsChanged }) {
             <b>{m.role}</b>: {m.content.map((c) => (c.type === 'text' ? c.text : `[tool: ${c.type}]`)).join(' ')}
           </div>
         ))}
-        {(events.filter((e) => e.type === 'text_delta')).slice(-200).map((e, i) => (
+        {(events.filter((e) => e.type === 'text_delta' && e.task_id === task.id)).slice(-200).map((e, i) => (
           <span key={i}>{e.text}</span>
         ))}
       </div>

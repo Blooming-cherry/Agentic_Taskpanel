@@ -13,8 +13,15 @@ export default function App() {
   const wsRef = useRef(null)
 
   const refresh = useCallback(async () => {
-    setTasks(await api.listTasks())
+    const data = await api.listTasks()
+    setTasks(data)
     setSelectedId((cur) => cur || null)
+    // 终态(done/error/stopped)任务的 text_delta 已被 REST 吸收进 task.messages,
+    // 从直播缓冲中清除,避免与最终消息重复渲染
+    const terminal = new Set(data.filter((t) => ['done', 'error', 'stopped'].includes(t.status)).map((t) => t.id))
+    if (terminal.size) {
+      setEvents((prev) => prev.filter((e) => !(e.type === 'text_delta' && terminal.has(e.task_id))))
+    }
   }, [])
 
   useEffect(() => {
