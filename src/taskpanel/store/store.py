@@ -67,7 +67,7 @@ class TaskStore:
         return sorted(tasks, key=lambda t: t.created_at)
 
     def _task_from_meta(self, m: dict) -> Task:
-        return Task(
+        t = Task(
             id=m["id"], kind=m["kind"], prompt=m["prompt"], cwd=m.get("cwd"),
             use_worktree=m.get("use_worktree", False), title=m["title"],
             status=TaskState(m.get("status", "queued")),
@@ -76,6 +76,9 @@ class TaskStore:
             error=m.get("error"), worktree=m.get("worktree"),
             keep_worktree=m.get("keep_worktree", False),
         )
+        # 恢复已持久化的对话历史: 重启后 follow-up 才能带着上下文续聊
+        t.messages = self.load_messages(m["id"])
+        return t
 
     def load_messages(self, task_id: str) -> list[dict]:
         p = self._dir(task_id) / "messages.jsonl"

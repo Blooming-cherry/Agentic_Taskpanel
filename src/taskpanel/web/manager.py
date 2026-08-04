@@ -167,6 +167,19 @@ class Manager:
     def events_since(self, task_id: str, seq: int):
         return self.store.events_since(task_id, seq)
 
+    def replay_events(self, last_event_id: int) -> list[dict]:
+        """断线补齐: 返回所有任务 seq > last_event_id 的事件,按全局 seq 升序。
+
+        客户端以全局水位(last_event_id)去重,回放流必须全局单调;若按任务逐个
+        回放,跨任务事件会出现全局 seq 倒序,低 seq 事件会被客户端误判为重复而
+        丢弃(补齐丢事件)。回归见 tests/test_manager.py。
+        """
+        replay = []
+        for t in self.list_tasks():
+            replay.extend(self.events_since(t.id, last_event_id))
+        replay.sort(key=lambda ev: ev["seq"])
+        return replay
+
     async def run_review(self, task_id: str, background: str = ""):
         task = self.get(task_id)
         if not task:
@@ -223,6 +236,12 @@ class Manager:
         try:
             await loop.follow_up(text)
             self.store.save_task(task)
+        except Exception as e:  # noqa: BLE001 与 _dispatch 一致: 失败落 ERROR 而非静默
+            task.status = TaskState.ERROR
+            task.error = str(e)
+            self.store.save_task(task)
+            full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
+            await self.broadcast(full)
         finally:
             self._loops.pop(task.id, None)
 

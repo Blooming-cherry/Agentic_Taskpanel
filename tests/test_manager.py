@@ -119,3 +119,114 @@ async def test_dispatch_retry_rolls_back_dirty_messages(tmp_path, monkeypatch):
                    for m in task.messages for c in m.get("content", []))
     assert not mgr._sem.locked()
     assert task.id not in mgr._loops
+
+
+class EchoStreamClient:
+    """stream 记录收到的 messages,直接 done(不产文本/工具),便于断言 follow-up
+    是否带着持久化的历史上下文。"""
+
+    def __init__(self):
+        self.seen_messages = []
+
+    async def probe(self):
+        return False
+
+    async def stream(self, messages, tools=None):
+        self.seen_messages.append(messages)
+        yield LLMEvent(type="done")
+
+
+async def test_replay_events_globally_sorted(tmp_path):
+    """断线补齐的回放必须按全局 seq 升序。
+
+    事件 seq 跨任务全局单调,但按任务逐个回放时,后建任务的低 seq 事件会排在
+    先建任务的高 seq 事件之后,导致回放流全局倒序;客户端以全局水位去重会把
+    倒序的低 seq 事件误判为重复而丢弃(补齐丢事件)。回归保护。
+    """
+    mgr = await _mgr(tmp_path)
+    a = make_task("chat", "a")
+    b = make_task("chat", "b")
+    mgr.store.save_task(a)
+    mgr.store.save_task(b)
+    mgr.store.append_event(a.id, {"type": "status", "status": "running"})  # seq 1
+    mgr.store.append_event(b.id, {"type": "status", "status": "running"})  # seq 2
+    mgr.store.append_event(a.id, {"type": "text_delta", "text": "x"})      # seq 3
+    mgr.store.append_event(b.id, {"type": "error", "error": "boom"})       # seq 4
+    mgr.store.append_event(a.id, {"type": "error", "error": "boom"})       # seq 5
+
+    replay = mgr.replay_events(0)
+    seqs = [e["seq"] for e in replay]
+    assert seqs == [1, 2, 3, 4, 5], "跨任务回放必须全局 seq 升序"
+    assert all(seqs[i] < seqs[i + 1] for i in range(len(seqs) - 1))
+
+    # 断线水位: 只补 > last_event_id 的事件,同样保持升序
+    replay2 = mgr.replay_events(2)
+    assert [e["seq"] for e in replay2] == [3, 4, 5]
+
+
+async def _wait_loop_done(mgr, task_id, timeout=5.0):
+    t0 = asyncio.get_running_loop().time()
+    while task_id in mgr._loops:
+        if asyncio.get_running_loop().time() - t0 > timeout:
+            raise AssertionError("follow-up loop did not finish")
+        await asyncio.sleep(0.02)
+
+
+async def test_follow_up_resumes_paused_with_context(tmp_path, monkeypatch):
+    """重启后 paused 任务 follow-up: 持久化历史必须恢复进 Task.messages,
+    并作为上下文传给下一次 stream(中断恢复『可续聊』的回归保护)。"""
+    client = EchoStreamClient()
+    monkeypatch.setattr("taskpanel.web.manager.build_client", lambda _cfg: client)
+    mgr = await _mgr(tmp_path)
+    task = make_task("chat", "origin")
+    task.status = TaskState.PAUSED
+    task.messages = [
+        {"role": "user", "content": [{"type": "text", "text": "origin"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "old reply"}]},
+    ]
+    mgr.store.save_task(task)
+    reloaded = mgr.get(task.id)  # 模拟重启后从 store 读回
+    assert len(reloaded.messages) == 2, "重启后历史必须被恢复"
+
+    r = await mgr.follow_up(reloaded.id, "follow")
+    assert r["status"] == "queued"
+    await _wait_loop_done(mgr, reloaded.id)
+
+    msgs = client.seen_messages[-1]
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+    texts = [c["text"] for m in msgs for c in m["content"] if c.get("type") == "text"]
+    assert "old reply" in texts and "follow" in texts
+
+
+async def test_follow_up_error_marks_error_and_broadcasts(tmp_path, monkeypatch):
+    """follow-up 后台执行抛错: 必须落 ERROR + 广播 error 事件(而非未捕获的
+    background task 异常),与 _dispatch 行为一致。"""
+    class BoomClient:
+        async def probe(self):
+            return False
+
+        async def stream(self, messages, tools=None):
+            raise RuntimeError("follow boom")
+            yield LLMEvent(type="done")  # noqa: B018 保持 async gen 形态,迭代时才抛错
+
+    monkeypatch.setattr("taskpanel.web.manager.build_client", lambda _cfg: BoomClient())
+    mgr = await _mgr(tmp_path)
+    task = make_task("chat", "hi")
+    task.status = TaskState.PAUSED
+    task.messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    mgr.store.save_task(task)
+    q = mgr.subscribe()
+
+    r = await mgr.follow_up(task.id, "go")
+    assert r["status"] == "queued"
+    await _wait_loop_done(mgr, task.id)
+
+    # follow_up 会从 store 重新读回任务对象,断言须基于重取后的实例
+    reloaded = mgr.get(task.id)
+    assert reloaded.id not in mgr._loops
+    assert reloaded.status == TaskState.ERROR
+    assert "follow boom" in reloaded.error
+    evs = []
+    while not q.empty():
+        evs.append(q.get_nowait())
+    assert any(e.get("type") == "error" and e.get("task_id") == task.id for e in evs)

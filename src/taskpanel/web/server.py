@@ -107,11 +107,11 @@ def create_app(cfg: PanelConfig | None = None) -> FastAPI:
         q = mgr.subscribe()
         try:
             max_seen = last_event_id
-            # 断线补齐: 补发所有任务 seq > last_event_id 的事件
-            for task in mgr.list_tasks():
-                for ev in mgr.events_since(task.id, last_event_id):
-                    await ws.send_json(ev)
-                    max_seen = max(max_seen, ev["seq"])
+            # 断线补齐: 补发所有任务 seq > last_event_id 的事件,按全局 seq 升序
+            # (客户端以全局水位去重,非单调的回放会把跨任务事件误判为重复)
+            for ev in mgr.replay_events(last_event_id):
+                await ws.send_json(ev)
+                max_seen = max(max_seen, ev["seq"])
             while True:
                 event = await q.get()
                 if event["seq"] <= max_seen:

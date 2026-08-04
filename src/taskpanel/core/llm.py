@@ -41,7 +41,7 @@ class AnthropicSDKClient(LLMClient):
     async def stream(self, messages, tools=None):
         kwargs = dict(
             model=self.cfg.model, max_tokens=4096, messages=messages,
-            stream=True, timeout=self.cfg.timeout,
+            timeout=self.cfg.timeout,
         )
         if tools:
             kwargs["tools"] = tools

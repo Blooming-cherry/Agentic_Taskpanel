@@ -20,6 +20,23 @@ def test_messages_persist(tmp_path):
     assert store.load_messages(t.id) == t.messages
 
 
+def test_load_restores_messages(tmp_path):
+    """重启后读回任务,持久化的对话历史必须恢复到 Task.messages,
+    follow-up 才能带上下文续聊(中断恢复验收项)。"""
+    store = TaskStore(tmp_path)
+    t = make_task("chat", "hi")
+    t.messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "old reply"}]},
+    ]
+    store.save_task(t)
+    assert store.load_tasks()[0].messages == t.messages
+    assert store.get_or_none(t.id).messages == t.messages
+    # 再次 save 不得把已有消息重复追加
+    store.save_task(store.get_or_none(t.id))
+    assert len(store.load_messages(t.id)) == 2
+
+
 def test_events_seq_monotonic(tmp_path):
     store = TaskStore(tmp_path)
     t = make_task("chat", "hi")
