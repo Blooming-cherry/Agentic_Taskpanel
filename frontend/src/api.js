@@ -24,25 +24,28 @@ export const deleteTask = (id) => jsonFetch(`/api/tasks/${id}`, { method: 'DELET
 export const fetchEvents = (id, since) => jsonFetch(`/api/tasks/${id}/events?since=${since}`)
 
 export function connectWS(onEvent) {
-  let ws, closed = false, retry = 0
-  const url = `ws://${location.host}/ws/tasks?token=${encodeURIComponent(TOKEN)}&last_event_id=${LAST_EVENT_ID}`
+  let ws, closed = false, retry = 0, timer = null
   function open() {
+    // 每次(重)连都用实时 TOKEN/LAST_EVENT_ID 构造 URL,避免水位冻结重复回放
+    const url = `ws://${location.host}/ws/tasks?token=${encodeURIComponent(TOKEN)}&last_event_id=${LAST_EVENT_ID}`
     ws = new WebSocket(url)
     ws.onmessage = (ev) => {
       const e = JSON.parse(ev.data)
-      if (e.seq > LAST_EVENT_ID) LAST_EVENT_ID = e.seq
+      if (e.seq <= LAST_EVENT_ID) return // 客户端去重: 旧水位重复回放的事件直接丢弃
+      LAST_EVENT_ID = e.seq
       onEvent(e)
     }
-    ws.onclose = () => { if (!closed) setTimeout(reconnect, Math.min(1000 * 2 ** retry++, 15000)) }
+    ws.onclose = () => { if (!closed) timer = setTimeout(reconnect, Math.min(1000 * 2 ** retry++, 15000)) }
     ws.onopen = () => { retry = 0 }
   }
-  async function reconnect() {
+  function reconnect() {
+    if (closed) return // close() 后不再重连
     // 用 REST 补齐可能错过的增量(断线期间的事件由服务端 events_since 补)
     onEvent({ type: 'reconnect' })
     open()
   }
   open()
-  return { close() { closed = true; ws?.close() } }
+  return { close() { closed = true; if (timer) clearTimeout(timer); ws?.close() } }
 }
 
 window.__api = {
