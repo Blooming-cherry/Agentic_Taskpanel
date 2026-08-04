@@ -20,7 +20,11 @@ class FollowBody(BaseModel):
     text: str
 
 
-def create_app(cfg: PanelConfig) -> FastAPI:
+def create_app(cfg: PanelConfig | None = None) -> FastAPI:
+    # cfg 缺省时自加载配置: 支持 `uvicorn taskpanel.web.server:create_app --factory`
+    if cfg is None:
+        from taskpanel.core.config import load_config
+        cfg = load_config()
     app = FastAPI()
     mgr = Manager(cfg)
 
