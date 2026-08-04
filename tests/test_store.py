@@ -63,5 +63,29 @@ def test_delete(tmp_path):
     store = TaskStore(tmp_path)
     t = make_task("chat", "hi")
     store.save_task(t)
-    store.delete_task(t.id)
+    assert store.delete_task(t.id) is True
+    assert store.load_tasks() == []
+
+
+def test_delete_rejects_bad_ids(tmp_path):
+    """delete_task 必须拒绝 "" / ".." / 未知 id: 返回 False 且绝不 rmtree
+    data_dir 或 tasks 目录(破坏性路径穿越,终审 Critical 1)。"""
+    store = TaskStore(tmp_path)
+    sentinel = tmp_path / "keep.txt"
+    sentinel.write_text("x", encoding="utf-8")
+    t = make_task("chat", "hi")
+    store.save_task(t)
+
+    assert store.delete_task("") is False
+    assert store.delete_task("..") is False
+    assert store.delete_task("nope") is False
+
+    # data_dir 完好: 哨兵文件与任务目录都在,任务仍可加载
+    assert sentinel.exists()
+    assert (tmp_path / "tasks").is_dir()
+    assert (tmp_path / "tasks" / t.id / "meta.json").exists()
+    assert [x.id for x in store.load_tasks()] == [t.id]
+
+    # 正常 id 删除仍然工作
+    assert store.delete_task(t.id) is True
     assert store.load_tasks() == []

@@ -99,6 +99,14 @@ class TaskStore:
                 out.append(ev)
         return out
 
-    def delete_task(self, task_id: str) -> None:
+    def delete_task(self, task_id: str) -> bool:
         import shutil
+        # 安全校验: task_id 必须是单段名称且任务真实存在。绝不允许 "" / "." /
+        # ".." / 含路径分隔符的 id —— 否则 rmtree 会上抛到 data_dir 甚至更上层,
+        # 把 .auth_token 与其它任务一并删掉(破坏性路径穿越,终审 Critical 1)。
+        if not task_id or task_id in (".", "..") or Path(task_id).name != task_id:
+            return False
+        if self.get_or_none(task_id) is None:
+            return False
         shutil.rmtree(self.tasks_dir / task_id, ignore_errors=True)
+        return True

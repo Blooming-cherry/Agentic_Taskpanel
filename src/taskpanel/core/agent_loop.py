@@ -70,19 +70,27 @@ class AgentLoop:
                 self.task.touch()
                 await self._emit({"type": "status", "status": self.task.status.value})
                 return TaskState.DONE
-            # 追加 assistant(tool_use) 与 tool_result,执行工具
-            self.task.messages.append(
-                {"role": "assistant",
-                 "content": [{"type": "tool_use", **c} for c in tool_calls]})
+            # 一轮内同时出现文本与多个 tool_use: assistant 消息必须合并为
+            # [{"type":"text",...}, {"type":"tool_use",...}...](Anthropic 分组),
+            # 不能丢弃 text_buf(终审 Important 2b)。
+            assistant_content = []
+            final_text = "".join(text_buf)
+            if final_text:
+                assistant_content.append({"type": "text", "text": final_text})
+            assistant_content += [{"type": "tool_use", **c} for c in tool_calls]
+            self.task.messages.append({"role": "assistant", "content": assistant_content})
+            # N 个 tool_use 对应 ONE 条 user(tool_result) 消息,内容块按顺序一一
+            # 对应(Anthropic 分组),而不是 N 条各自带一个 tool_result 的 user 消息
+            # (终审 Important 2a)。
+            tool_results = []
             for c in tool_calls:
                 result = await execute_tool(c["name"], c.get("input", {}),
                                             self.task, self.root)
-                self.task.messages.append(
-                    {"role": "user",
-                     "content": [{"type": "tool_result",
-                                  "tool_use_id": c["id"], "content": result}]})
+                tool_results.append({"type": "tool_result",
+                                     "tool_use_id": c["id"], "content": result})
                 await self._emit({"type": "tool_result",
                                   "tool_use_id": c["id"], "content": result})
+            self.task.messages.append({"role": "user", "content": tool_results})
         # 超轮次或被打断
         self.task.status = TaskState.PAUSED if self._stop.is_set() else TaskState.PAUSED
         self.task.touch()

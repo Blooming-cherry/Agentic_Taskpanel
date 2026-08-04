@@ -34,14 +34,22 @@ class WorktreeManager:
         subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", path],
                        check=False, capture_output=True)
 
-    def cleanup(self) -> int:
-        """删除超出 max_retained 的 worktree。调用方应先移走仍活跃的任务,
-        否则按创建时间保留最近 max_retained 个。"""
+    def cleanup(self, active: set[str] | None = None) -> int:
+        """删除 stale 且超出 max_retained 的 worktree,返回清理数。
+
+        active: 仍被任务引用的 worktree 路径集合(由调用方把活跃任务与
+        keep_worktree 任务的 worktree 并进来),集合内的路径永不删除。
+        只对未被引用的 stale worktree 按创建时间保留最近 max_retained 个,
+        其余删除——避免清理把正在使用的 worktree 删掉。
+        """
         if not self.base_dir.exists():
             return 0
-        wts = sorted(self.base_dir.iterdir(), key=lambda p: p.stat().st_mtime)
+        protected = {str(Path(p).expanduser().resolve()) for p in (active or set())}
+        stale = [p for p in self.base_dir.iterdir()
+                 if str(p.expanduser().resolve()) not in protected]
+        stale.sort(key=lambda p: p.stat().st_mtime)
         removed = 0
-        for wt in wts[:max(0, len(wts) - self.max_retained)]:
+        for wt in stale[:max(0, len(stale) - self.max_retained)]:
             self.remove(str(wt))
             removed += 1
         return removed

@@ -25,6 +25,9 @@ class Manager:
         self._sem: asyncio.Semaphore | None = None
         self._probe_cache: dict[tuple, bool] = {}
         self._reviews: dict[str, dict] = {}
+        # 已删除任务集合: 阻止 _dispatch/_run_follow 在删除后再次 save_task
+        # (重建任务目录)或 emit 事件,终结"删除运行中任务被复活"的问题。
+        self._deleted: set[str] = set()
 
     async def startup(self):
         self.store = TaskStore(self.cfg.data_dir)
@@ -55,11 +58,24 @@ class Manager:
         assert self._token
         return self._token
 
+    def _active_worktrees(self) -> set[str]:
+        """返回不应被清理的 worktree 路径集合:
+        活跃任务(非终态)引用的 worktree,以及 keep_worktree=True 任务
+        (即使已终态)的 worktree。清理只针对未被引用的 stale worktree。"""
+        terminal = (TaskState.DONE, TaskState.ERROR, TaskState.STOPPED)
+        active = set()
+        for t in self.list_tasks():
+            if not t.worktree:
+                continue
+            if t.status not in terminal or t.keep_worktree:
+                active.add(t.worktree)
+        return active
+
     async def _cleanup_loop(self):
         while True:
             await asyncio.sleep(600)
             if self.wt:
-                self.wt.cleanup()
+                self.wt.cleanup(self._active_worktrees())
 
     async def _root_for(self, task: Task) -> str:
         if task.use_worktree and task.cwd and self.wt:
@@ -110,7 +126,9 @@ class Manager:
                 snapshot = list(task.messages)
                 try:
                     await loop.run()
-                    self.store.save_task(task)
+                    # 任务可能已被 delete(): 不能 save_task 重建目录
+                    if task.id not in self._deleted:
+                        self.store.save_task(task)
                     return
                 except Exception as e:  # noqa: BLE001 协议/网络错误
                     # 回滚本次尝试写入的半轮消息(如 tool_use 缺 tool_result),
@@ -127,11 +145,12 @@ class Manager:
                     await asyncio.sleep(2 ** attempt)
             raise last_err
         except Exception as e:  # noqa: BLE001
-            task.status = TaskState.ERROR
-            task.error = str(e)
-            self.store.save_task(task)
-            full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
-            await self.broadcast(full)
+            if task.id not in self._deleted:
+                task.status = TaskState.ERROR
+                task.error = str(e)
+                self.store.save_task(task)
+                full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
+                await self.broadcast(full)
         finally:
             if self._sem is not None:
                 self._sem.release()
@@ -139,6 +158,9 @@ class Manager:
 
     def _emit_for(self, task_id: str):
         async def emit(event: dict):
+            # 已删除任务不再追加事件: append_event 的 _dir() 会 mkdir 重建目录
+            if task_id in self._deleted:
+                return
             full = self.store.append_event(task_id, event)
             await self.broadcast(full)
             # 顺带把文本/tool 结果也持久化进消息历史
@@ -216,32 +238,37 @@ class Manager:
         return {"path": str(full), "start": lo + 1, "lines": lines[lo:hi]}
 
     async def follow_up(self, task_id: str, text: str):
-        loop = self._loops.get(task_id)
         task = self.get(task_id)
-        if loop and task:
-            asyncio.create_task(self._run_follow(loop, task, text))
-            return {"status": "queued"}
-        if task:
-            # 已完成任务: 新建 loop
-            client = build_client(self.cfg.llm)
-            loop = AgentLoop(task, client, self._tools_for(task), task.cwd or ".",
-                             emit=self._emit_for(task.id),
-                             max_rounds=self.cfg.llm.max_tool_rounds)
-            self._loops[task_id] = loop
-            asyncio.create_task(self._run_follow(loop, task, text))
-            return {"status": "queued"}
-        raise KeyError(task_id)
+        if not task:
+            raise KeyError(task_id)
+        # 任务正在跑(或已在 _loops 注册): 拒绝并发 follow-up,避免同一任务
+        # 双 AgentLoop 并发写历史/重复执行工具(终审 Important 4)。
+        if task.status in (TaskState.RUNNING, TaskState.QUEUED) or task_id in self._loops:
+            return {"status": "busy"}
+        # 已完成/暂停任务: 新建 loop 续聊;worktree 任务 root 必须指向
+        # task.worktree(而非 cwd),与 run_review 一致(终审 Important 6)。
+        client = build_client(self.cfg.llm)
+        root = task.worktree or task.cwd or "."
+        loop = AgentLoop(task, client, self._tools_for(task), root,
+                         emit=self._emit_for(task.id),
+                         max_rounds=self.cfg.llm.max_tool_rounds)
+        self._loops[task_id] = loop
+        asyncio.create_task(self._run_follow(loop, task, text))
+        return {"status": "queued"}
 
     async def _run_follow(self, loop, task, text):
         try:
             await loop.follow_up(text)
-            self.store.save_task(task)
+            # 任务可能已被 delete(): 不能 save_task 重建目录
+            if task.id not in self._deleted:
+                self.store.save_task(task)
         except Exception as e:  # noqa: BLE001 与 _dispatch 一致: 失败落 ERROR 而非静默
-            task.status = TaskState.ERROR
-            task.error = str(e)
-            self.store.save_task(task)
-            full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
-            await self.broadcast(full)
+            if task.id not in self._deleted:
+                task.status = TaskState.ERROR
+                task.error = str(e)
+                self.store.save_task(task)
+                full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
+                await self.broadcast(full)
         finally:
             self._loops.pop(task.id, None)
 
@@ -251,6 +278,11 @@ class Manager:
             loop.cancel()
 
     async def delete(self, task_id: str):
+        if self.get(task_id) is None:
+            raise KeyError(task_id)
+        # 先标记删除再取消循环: 防止仍在跑的 _dispatch/_run_follow 在
+        # rmtree 之后又 save_task,把任务目录"复活"回来。
+        self._deleted.add(task_id)
         loop = self._loops.get(task_id)
         if loop:
             loop.cancel()

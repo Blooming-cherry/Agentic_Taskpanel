@@ -70,7 +70,11 @@ def create_app(cfg: PanelConfig | None = None) -> FastAPI:
 
     @app.delete("/api/tasks/{task_id}", dependencies=[Depends(auth)])
     async def delete(task_id: str):
-        await mgr.delete(task_id)
+        try:
+            await mgr.delete(task_id)
+        except KeyError:
+            # 不存在的任务 / "" / ".." 等非法 id: 404,且绝不触碰 data_dir
+            raise HTTPException(404, "task not found")
         return {"ok": True}
 
     @app.post("/api/tasks/{task_id}/review", dependencies=[Depends(auth)])

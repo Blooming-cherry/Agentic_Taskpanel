@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getReview, fetchContext } from '../api.js'
+import { getReview, fetchContext, runReview } from '../api.js'
 
 function DiffPreview({ taskId, file, line, context }) {
   const [data, setData] = useState(null)
@@ -26,11 +26,21 @@ export default function ReviewPane({ task, diffContext }) {
     getReview(task.id).then(setReview).catch(() => setReview(null))
   }, [task.id])
 
+  async function onRunReview() {
+    try {
+      await runReview(task.id)
+      setReview(await getReview(task.id))
+    } catch {
+      setReview(null)
+    }
+  }
+
   const findings = review?.findings || []
   const shown = severity === 'all' ? findings : findings.filter((f) => f.severity === severity)
   return (
     <aside className="review">
       <h3>Review</h3>
+      <button onClick={onRunReview} style={{ marginBottom: 8 }}>运行 Review</button>
       <select value={severity} onChange={(e) => setSeverity(e.target.value)}>
         <option value="all">全部</option><option value="high">High</option>
         <option value="medium">Medium</option><option value="low">Low</option>
