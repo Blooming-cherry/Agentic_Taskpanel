@@ -106,33 +106,45 @@ queued → running → (waiting_tool) → done
   - 环境变量: `OCR_LLM_URL=<base_url>/v1/messages`、`OCR_LLM_TOKEN`、`OCR_LLM_MODEL`、`OCR_USE_ANTHROPIC=true`。
   - 前置校验: 启动时 `ocr llm test`。
   - 结果: `ocr session comments --json <session-id>` 解析为结构化 line-level 发现列表。
+  - 子进程监督: 超时 `ocr_timeout`(默认 30 分钟,超时 kill);`stderr` 全程捕获;`--json` 解析失败时在 Review 面板以 **Raw Output** 展示原始输出与 stderr,避免永久 Loading。
 - **Delegation 模式(二期)**: 把 `ocr delegate preview` / `ocr delegate rule` 封装成 agent 工具,让通用 agent 任务借用 OCR 的确定性文件选择 + 规则解析做 review(宿主 = 面板的 agent,OCR 不配置 LLM)。
 
 ### 4.2 Review 任务输出
 
 - 面板右栏 **Review 面板**展示: 发现列表(严重级 High/Medium/Low 筛选)、文件/行号锚点、对应 diff 预览。
+- diff 预览默认显示锚点行 + 上下 `diff_context_lines` 行(默认 8,可在设置调整),允许临时展开更多上下文,避免仅看锚点行误判(无需重新请求 LLM)。
 - 支持一键在发现与 diff 之间跳转(二期: 逐条接受/拒绝)。
 
 ## 5. 并行与隔离
 
 - **默认全并行**(对齐 Codex 心智): 新任务不排队。可选配置 `max_parallel` 限制并发,超出排队 `queued`。
 - **每任务独立消息历史** → 上下文天然隔离,互不挤占。
-- **worktree 隔离**: project 任务可选 `worktree: true`,创建独立 `git worktree`(detached HEAD)作为任务 cwd,多个改码/审查任务同仓库并行不冲突。任务结束后按需保留或清理。
-- 全局"共享记忆"目录 `~/.taskpanel/shared/`: 任务间显式交换信息,默认关闭。
+- **worktree 隔离**: project 任务可选 `worktree: true`,创建独立 `git worktree`(detached HEAD)作为任务 cwd,多个改码/审查任务同仓库并行不冲突。
+- **worktree 自动清理**: 配置 `worktree_auto_cleanup`(默认 true)与 `max_retained_worktrees`(默认 5)。任务结束且未标记 `keep_worktree` 时,worktree 标记 stale;后台任务(每次启动 + 每 10 分钟)回收 stale 且超出上限的 worktree(`git worktree remove --force`),防止 `.git/worktrees` 无限膨胀。
+- 全局"共享记忆"目录 `~/.taskpanel/shared/`: 任务间显式交换信息,默认关闭。**并发语义**: 仅支持追加写(append-only),每文件一行;写入先加锁(`fcntl.flock` / Windows `msvcrt.locking`)再追加;读取支持游标从文件末尾续读。
 
 ## 6. taskpanel-store(持久化)
 
 - 每任务 `~/.taskpanel/tasks/<id>/`:
   - `messages.jsonl`: 每轮消息即写(流式增量落盘)。
+  - `events.jsonl`: 与 WS 同源的事件流,每条带自增 `seq`(断线重连补齐用,见 §7.1)。
   - `meta.json`: 状态、标题、kind、cwd、worktree、token、时间戳。
 - 启动时扫描已有任务,`resume` 恢复: 恢复状态与消息历史,可继续 follow-up 或重跑。
 - 崩溃安全: JSONL 每轮写入,重启自动恢复。
+- `messages.jsonl` Schema 示例:
+  ```json
+  {"role":"user","content":[{"type":"text","text":"审查 src/app.ts"}]}
+  {"role":"assistant","content":[{"type":"text","text":"开始审查…"}]}
+  {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{"cmd":"git diff"}}]}
+  {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"输出…"}]}
+  ```
 
 ## 7. taskpanel-web(视图层)
 
 ### 7.1 后端
 
-- **FastAPI + uvicorn**,绑定 `127.0.0.1`(仅本机,免鉴权)。
+- **FastAPI + uvicorn**,绑定 `127.0.0.1`(仅本机)。
+- **鉴权**: 启动时生成随机 token 存 `~/.taskpanel/.auth_token`(权限 0600);所有 REST 请求带 `X-Auth-Token` 头,WebSocket 用 `?token=` 参数,校验失败 401。前端同源(由 FastAPI 托管静态资源)经 `GET /api/bootstrap` 获取 token;不开启跨源 CORS,抵御 DNS Rebinding / 跨站请求。
 - REST 端点:
   - `POST /api/tasks` 新建任务(`kind`、`prompt`、`cwd`、`worktree`)
   - `GET /api/tasks` 列表
@@ -141,7 +153,8 @@ queued → running → (waiting_tool) → done
   - `POST /api/tasks/{id}/stop` 终止 / `pause` 打断
   - `DELETE /api/tasks/{id}` 删除
   - `GET /api/tasks/{id}/review` OCR 发现
-- **WebSocket `/ws/tasks`**: 推送任务状态变更与流式输出事件(增量文本 / tool_use / tool_result / status)。
+  - `GET /api/tasks/{id}/events?since=<seq>` 补齐指定偏移后的事件(断线重连)
+- **WebSocket `/ws/tasks?token=...`**: 推送任务状态变更与流式输出事件(增量文本 / tool_use / tool_result / status),每条事件带自增 `seq`;客户端可在连接时携带 `last_event_id`,服务端补发 `seq > last_event_id` 的存量事件(见 §6 `events.jsonl`)。
 - 配置: `config.toml` 或环境变量 —— `[llm] base_url/api_key/model`、`[ocr] env` 透传、`[panel] max_parallel/bind/host`。
 
 ### 7.2 前端(React + Vite)
@@ -170,6 +183,7 @@ queued → running → (waiting_tool) → done
 
 - **API 失败/超时**: 指数退避重试(最多 3 次)→ 仍失败标记 `error`,保留上下文可重试。
 - **工具执行失败**: 把错误信息作为 `tool_result` 回填给模型继续。
+- **OCR 子进程异常**: 挂起 → 超时 kill;崩溃/OOM → 捕获退出码 + stderr 展示;输出非 JSON → Raw Output 兜底。
 - **shim 协议不兼容**: 自动从 `AnthropicSDKClient` 回退 `RawHTTPClient`;tool_use 不支持则降级纯文本。
 - **面板崩溃**: JSONL 每轮落盘,重启自动恢复。
 
@@ -178,6 +192,7 @@ queued → running → (waiting_tool) → done
 - **core 单测**: 状态机转换、AgentLoop 工具分支(fake LLM 响应)、store 往返、能力探测 mock、config 加载。
 - **API 测试**: FastAPI 端点 CRUD + WebSocket 事件(mock LLM)。
 - **OCR 冒烟**: 对一个小 git 仓库实际跑 `ocr llm test` + `ocr review`。
+- **中断恢复测试(P2)**: 任务运行到一半(含一个未完成的 tool_result)杀掉进程,重启后验证可无缝续聊、中间态工具结果不丢失。
 - **前端冒烟**: 起后端 + `npm run build` + 打开页面验证三栏渲染与任务创建。
 
 ## 10. 范围与延迟项
@@ -193,11 +208,11 @@ queued → running → (waiting_tool) → done
 
 ## 11. 技术栈清单
 
-- Python 3.11+、uv
-- FastAPI + uvicorn + websockets
+- Python 3.11+(包管理用 **uv**)
+- **FastAPI** + uvicorn + websockets
 - anthropic SDK(可选,仅作 HTTP 客户端)+ httpx
 - React 18 + Vite
-- npm(`@alibaba-group/open-code-review`,OCR)
+- npm 包 `@alibaba-group/open-code-review`(公开 npm 源:`npm i -g`,OCR)
 - git ≥ 2.41(已满足)
 
 ## 12. 成功标准
