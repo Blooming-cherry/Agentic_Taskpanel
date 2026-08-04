@@ -31,6 +31,17 @@ def test_events_seq_monotonic(tmp_path):
     assert [e["seq"] for e in since] == [2]
 
 
+def test_events_seq_global_monotonic_across_tasks(tmp_path):
+    store = TaskStore(tmp_path)
+    a = make_task("chat", "a")
+    b = make_task("chat", "b")
+    store.save_task(a)
+    store.save_task(b)
+    assert store.append_event(a.id, {"type": "text_delta", "text": "a1"})["seq"] == 1
+    assert store.append_event(a.id, {"type": "text_delta", "text": "a2"})["seq"] == 2
+    assert store.append_event(b.id, {"type": "text_delta", "text": "b1"})["seq"] == 3
+
+
 def test_delete(tmp_path):
     store = TaskStore(tmp_path)
     t = make_task("chat", "hi")

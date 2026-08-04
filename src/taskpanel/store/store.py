@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import threading
 from pathlib import Path
 
 from taskpanel.core.task import Task, TaskState
@@ -10,6 +11,9 @@ class TaskStore:
         self.data_dir = Path(data_dir).expanduser()
         self.tasks_dir = self.data_dir / "tasks"
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        # 事件 seq 全局单调递增(跨任务),断线补齐与前端单水位线都依赖它
+        self._seq_lock = threading.Lock()
+        self._seq_path = self.data_dir / "seq"
 
     def _dir(self, task_id: str) -> Path:
         d = self.tasks_dir / task_id
@@ -37,8 +41,12 @@ class TaskStore:
     def append_event(self, task_id: str, event: dict) -> dict:
         d = self._dir(task_id)
         ev_path = d / "events.jsonl"
-        seq = ev_path.read_text(encoding="utf-8").count("\n") if ev_path.exists() else 0
-        seq += 1
+        # 全局 seq: 跨任务单调递增,由 data_dir/seq 文件在锁内推进
+        with self._seq_lock:
+            n = int(self._seq_path.read_text()) if self._seq_path.exists() else 0
+            n += 1
+            self._seq_path.write_text(str(n))
+            seq = n
         full = {"seq": seq, "task_id": task_id, **event}
         with ev_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(full, ensure_ascii=False) + "\n")
