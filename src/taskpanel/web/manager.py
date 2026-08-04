@@ -124,7 +124,8 @@ class Manager:
             task.status = TaskState.ERROR
             task.error = str(e)
             self.store.save_task(task)
-            await self.broadcast({"type": "error", "task_id": task.id, "error": str(e)})
+            full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
+            await self.broadcast(full)
         finally:
             if self._sem is not None:
                 self._sem.release()

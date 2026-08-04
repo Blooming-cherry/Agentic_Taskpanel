@@ -74,15 +74,22 @@ def create_app(cfg: PanelConfig) -> FastAPI:
         return mgr.events_since(task_id, since)
 
     @app.websocket("/ws/tasks")
-    async def ws(ws: WebSocket, token: str = Query("")):
+    async def ws(ws: WebSocket, token: str = Query(""),
+                 last_event_id: int = Query(0)):
         if token != mgr.auth_token():
             await ws.close(code=4401)
             return
         await ws.accept()
+        # 断线补齐: 补发所有任务 seq > last_event_id 的事件
+        for task in mgr.list_tasks():
+            for ev in mgr.events_since(task.id, last_event_id):
+                await ws.send_json(ev)
         q = mgr.subscribe()
         try:
             while True:
                 event = await q.get()
+                if event["seq"] <= last_event_id:
+                    continue
                 await ws.send_json(event)
         except WebSocketDisconnect:
             pass
