@@ -45,6 +45,11 @@ class Manager:
                 pass
         if self.cfg.worktree_auto_cleanup:
             asyncio.create_task(self._cleanup_loop())
+        # 崩溃恢复: 旧的 running/queued 标记为 paused,保留上下文
+        for t in self.store.load_tasks():
+            if t.status in (TaskState.RUNNING, TaskState.QUEUED):
+                t.status = TaskState.PAUSED
+                self.store.save_task(t)
 
     def auth_token(self) -> str:
         assert self._token
