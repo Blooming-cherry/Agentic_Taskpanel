@@ -30,14 +30,19 @@ def test_ws_receives_events_and_replays(client):
         if client.get(f"/api/tasks/{t['id']}/events", headers=h).json():
             break
         time.sleep(0.1)
-    # 订阅后先回放存量事件(seq > last_event_id)
+    # 先订阅再回放: last_event_id=0 低于存量 seq,存量事件应被回放
     with client.websocket_connect(f"/ws/tasks?token={token}") as ws:
         replayed = ws.receive_json()
         assert replayed["task_id"] == t["id"]
-        # 实时推送: 订阅后建第二个任务,应收到其 status/queued 事件
+        seen = {(replayed["task_id"], replayed["seq"])}
+        # 实时推送: 订阅后建第二个任务,应收到其 status/queued 事件;
+        # 逐个去重,回放与实时推送不得重复投递同一事件。
         t2 = client.post("/api/tasks", json={"kind": "chat", "prompt": "hi2"}, headers=h).json()
         got = ws.receive_json()
         while got["task_id"] != t2["id"]:
+            assert (got["task_id"], got["seq"]) not in seen, "事件被重复推送"
+            seen.add((got["task_id"], got["seq"]))
             got = ws.receive_json()
+        assert (got["task_id"], got["seq"]) not in seen, "事件被重复推送"
         assert got["type"] == "status"
         assert got["task_id"] == t2["id"]

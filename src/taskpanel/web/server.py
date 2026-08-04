@@ -80,15 +80,19 @@ def create_app(cfg: PanelConfig) -> FastAPI:
             await ws.close(code=4401)
             return
         await ws.accept()
-        # 断线补齐: 补发所有任务 seq > last_event_id 的事件
-        for task in mgr.list_tasks():
-            for ev in mgr.events_since(task.id, last_event_id):
-                await ws.send_json(ev)
+        # 先订阅再回放: 消除 store 读取与 subscribe 之间追加事件
+        # (既不回放也不实时推送)的丢失窗口。
         q = mgr.subscribe()
         try:
+            max_seen = last_event_id
+            # 断线补齐: 补发所有任务 seq > last_event_id 的事件
+            for task in mgr.list_tasks():
+                for ev in mgr.events_since(task.id, last_event_id):
+                    await ws.send_json(ev)
+                    max_seen = max(max_seen, ev["seq"])
             while True:
                 event = await q.get()
-                if event["seq"] <= last_event_id:
+                if event["seq"] <= max_seen:
                     continue
                 await ws.send_json(event)
         except WebSocketDisconnect:
