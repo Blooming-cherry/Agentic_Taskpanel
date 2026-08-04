@@ -24,6 +24,7 @@ class Manager:
         self._subs: set[asyncio.Queue] = set()
         self._sem: asyncio.Semaphore | None = None
         self._probe_cache: dict[tuple, bool] = {}
+        self._reviews: dict[str, dict] = {}
 
     async def startup(self):
         self.store = TaskStore(self.cfg.data_dir)
@@ -160,6 +161,31 @@ class Manager:
 
     def events_since(self, task_id: str, seq: int):
         return self.store.events_since(task_id, seq)
+
+    async def run_review(self, task_id: str, background: str = ""):
+        task = self.get(task_id)
+        if not task:
+            raise KeyError(task_id)
+        root = task.worktree or task.cwd or "."
+        result = await self.ocr.run_review(root, background=background)
+        self._reviews[task_id] = result
+        return result
+
+    def get_review(self, task_id: str) -> dict:
+        return self._reviews.get(task_id, {"findings": [], "raw": None, "stderr": None})
+
+    async def get_context(self, task_id: str, path: str, line: int, context: int = 8) -> dict:
+        """返回锚点行 ±context 行的文件内容,供 diff 预览展开。"""
+        task = self.get(task_id)
+        if not task:
+            raise KeyError(task_id)
+        root = Path(task.worktree or task.cwd or ".")
+        full = Path(path)
+        if not full.is_absolute():
+            full = root / full
+        lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        lo, hi = max(0, line - 1 - context), min(len(lines), line + context)
+        return {"path": str(full), "start": lo + 1, "lines": lines[lo:hi]}
 
     async def follow_up(self, task_id: str, text: str):
         loop = self._loops.get(task_id)

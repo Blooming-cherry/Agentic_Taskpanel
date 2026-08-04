@@ -22,6 +22,9 @@ export const sendMessage = (id, text) => jsonFetch(`/api/tasks/${id}/messages`, 
 export const stopTask = (id) => jsonFetch(`/api/tasks/${id}/stop`, { method: 'POST' })
 export const deleteTask = (id) => jsonFetch(`/api/tasks/${id}`, { method: 'DELETE' })
 export const fetchEvents = (id, since) => jsonFetch(`/api/tasks/${id}/events?since=${since}`)
+export const getReview = (id) => jsonFetch(`/api/tasks/${id}/review`)
+export const fetchContext = (id, path, line, context) =>
+  jsonFetch(`/api/tasks/${id}/context?path=${encodeURIComponent(path)}&line=${line}&context=${context}`)
 
 export function connectWS(onEvent) {
   let ws, closed = false, retry = 0, timer = null

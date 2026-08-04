@@ -69,6 +69,24 @@ def create_app(cfg: PanelConfig) -> FastAPI:
         await mgr.delete(task_id)
         return {"ok": True}
 
+    @app.post("/api/tasks/{task_id}/review", dependencies=[Depends(auth)])
+    async def run_review(task_id: str, background: str = ""):
+        try:
+            return await mgr.run_review(task_id, background)
+        except KeyError:
+            raise HTTPException(404, "task not found")
+
+    @app.get("/api/tasks/{task_id}/review", dependencies=[Depends(auth)])
+    async def get_review(task_id: str):
+        return mgr.get_review(task_id)
+
+    @app.get("/api/tasks/{task_id}/context", dependencies=[Depends(auth)])
+    async def get_context(task_id: str, path: str, line: int, context: int = 8):
+        try:
+            return await mgr.get_context(task_id, path, line, context)
+        except (KeyError, FileNotFoundError):
+            raise HTTPException(404, "not found")
+
     @app.get("/api/tasks/{task_id}/events", dependencies=[Depends(auth)])
     async def events(task_id: str, since: int = Query(0)):
         return mgr.events_since(task_id, since)

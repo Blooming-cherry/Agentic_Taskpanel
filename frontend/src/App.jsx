@@ -3,6 +3,7 @@ import * as api from './api.js'
 import Sidebar from './components/Sidebar.jsx'
 import ChatPane from './components/ChatPane.jsx'
 import StatusBar from './components/StatusBar.jsx'
+import ReviewPane from './components/ReviewPane.jsx'
 import './styles.css'
 
 export default function App() {
@@ -10,6 +11,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null)
   const [events, setEvents] = useState([])
   const [wsOk, setWsOk] = useState(false)
+  const [showReview, setShowReview] = useState(true)
   const wsRef = useRef(null)
 
   const refresh = useCallback(async () => {
@@ -48,6 +50,12 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') setShowReview((v) => !v) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   const selected = tasks.find((t) => t.id === selectedId) || null
   return (
     <>
@@ -55,6 +63,7 @@ export default function App() {
         <Sidebar tasks={tasks} selectedId={selectedId} onSelect={setSelectedId} onTasksChanged={refresh} />
         {selected ? <ChatPane task={selected} events={events} onEventsChanged={refresh} />
                   : <div className="pane" style={{ placeContent: 'center', textAlign: 'center', color: '#888' }}>选择左侧任务开始</div>}
+        {selected && showReview && <ReviewPane task={selected} diffContext={8} />}
       </div>
       <StatusBar tasks={tasks} wsOk={wsOk} />
     </>
