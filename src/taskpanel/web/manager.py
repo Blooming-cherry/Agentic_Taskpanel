@@ -1,0 +1,289 @@
+from __future__ import annotations
+import asyncio
+import secrets
+from pathlib import Path
+
+from taskpanel.core.config import PanelConfig
+from taskpanel.core.task import Task, TaskState, make_task
+from taskpanel.core.llm import build_client, LLMClient, AnthropicSDKClient
+from taskpanel.core.agent_loop import AgentLoop
+from taskpanel.core.tools import BUILTIN_TOOLS, chat_tools
+from taskpanel.core.ocr import OcrRunner
+from taskpanel.store.store import TaskStore
+from taskpanel.store.worktree import WorktreeManager
+
+
+class Manager:
+    def __init__(self, cfg: PanelConfig):
+        self.cfg = cfg
+        self.store: TaskStore | None = None
+        self.wt: WorktreeManager | None = None
+        self.ocr = OcrRunner(timeout=cfg.ocr_timeout)
+        self._token: str | None = None
+        self._loops: dict[str, AgentLoop] = {}
+        self._subs: set[asyncio.Queue] = set()
+        self._sem: asyncio.Semaphore | None = None
+        self._probe_cache: dict[tuple, bool] = {}
+        self._reviews: dict[str, dict] = {}
+        # 已删除任务集合: 阻止 _dispatch/_run_follow 在删除后再次 save_task
+        # (重建任务目录)或 emit 事件,终结"删除运行中任务被复活"的问题。
+        self._deleted: set[str] = set()
+
+    async def startup(self):
+        self.store = TaskStore(self.cfg.data_dir)
+        self.wt = WorktreeManager(auto_cleanup=self.cfg.worktree_auto_cleanup,
+                                  max_retained=self.cfg.max_retained_worktrees)
+        if self.cfg.max_parallel:
+            self._sem = asyncio.Semaphore(self.cfg.max_parallel)
+        tok_path = self.cfg.data_dir / ".auth_token"
+        if tok_path.exists():
+            self._token = tok_path.read_text(encoding="utf-8").strip()
+        else:
+            self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
+            self._token = secrets.token_hex(16)
+            tok_path.write_text(self._token, encoding="utf-8")
+            try:
+                tok_path.chmod(0o600)
+            except OSError:
+                pass
+        if self.cfg.worktree_auto_cleanup:
+            asyncio.create_task(self._cleanup_loop())
+        # 崩溃恢复: 旧的 running/queued 标记为 paused,保留上下文
+        for t in self.store.load_tasks():
+            if t.status in (TaskState.RUNNING, TaskState.QUEUED):
+                t.status = TaskState.PAUSED
+                self.store.save_task(t)
+
+    def auth_token(self) -> str:
+        assert self._token
+        return self._token
+
+    def _active_worktrees(self) -> set[str]:
+        """返回不应被清理的 worktree 路径集合:
+        活跃任务(非终态)引用的 worktree,以及 keep_worktree=True 任务
+        (即使已终态)的 worktree。清理只针对未被引用的 stale worktree。"""
+        terminal = (TaskState.DONE, TaskState.ERROR, TaskState.STOPPED)
+        active = set()
+        for t in self.list_tasks():
+            if not t.worktree:
+                continue
+            if t.status not in terminal or t.keep_worktree:
+                active.add(t.worktree)
+        return active
+
+    async def _cleanup_loop(self):
+        while True:
+            await asyncio.sleep(600)
+            if self.wt:
+                self.wt.cleanup(self._active_worktrees())
+
+    async def _root_for(self, task: Task) -> str:
+        if task.use_worktree and task.cwd and self.wt:
+            wt = self.wt.create(task.cwd)
+            task.worktree = wt
+            self.store.save_task(task)
+            return wt
+        return task.cwd or "."
+
+    async def create_task(self, kind, prompt, cwd=None,
+                          use_worktree=False) -> Task:
+        task = make_task(kind, prompt, cwd=cwd, use_worktree=use_worktree)
+        self.store.save_task(task)
+        # 信号量在 _dispatch 内获取并释放:create_task 不再持有,消除
+        # acquire 之后、spawn 之前被取消导致的永不释放泄漏窗口。
+        asyncio.create_task(self._dispatch(task))
+        return task
+
+    def _tools_for(self, task: Task) -> list[dict]:
+        if task.kind != "project":
+            return chat_tools()
+        key = (self.cfg.llm.base_url, self.cfg.llm.model)
+        if key not in self._probe_cache:
+            return chat_tools()  # 探测未完成,先用纯文本
+        return BUILTIN_TOOLS if self._probe_cache[key] else chat_tools()
+
+    async def _dispatch(self, task: Task):
+        # 信号量在 _dispatch 内获取/释放:入口抛错(如 _root_for /
+        # build_client)或任务中途被取消时,finally 仍会释放,不留泄漏窗口。
+        if self._sem is not None:
+            await self._sem.acquire()
+        try:
+            root = await self._root_for(task)
+            client = build_client(self.cfg.llm)
+            key = (self.cfg.llm.base_url, self.cfg.llm.model)
+            if key not in self._probe_cache:
+                try:
+                    self._probe_cache[key] = await client.probe()
+                except Exception:
+                    self._probe_cache[key] = False
+            tools = self._tools_for(task)
+            loop = AgentLoop(task, client, tools, root,
+                             emit=self._emit_for(task.id),
+                             max_rounds=self.cfg.llm.max_tool_rounds)
+            self._loops[task.id] = loop
+            last_err = None
+            for attempt in range(self.cfg.llm.max_retries):
+                snapshot = list(task.messages)
+                try:
+                    await loop.run()
+                    # 任务可能已被 delete(): 不能 save_task 重建目录
+                    if task.id not in self._deleted:
+                        self.store.save_task(task)
+                    return
+                except Exception as e:  # noqa: BLE001 协议/网络错误
+                    # 回滚本次尝试写入的半轮消息(如 tool_use 缺 tool_result),
+                    # 避免下一次 attempt 带着脏上下文重跑。
+                    task.messages[:] = snapshot
+                    last_err = e
+                    if attempt == 0 and isinstance(client, AnthropicSDKClient):
+                        from taskpanel.core.llm_raw import RawHTTPClient
+                        client = RawHTTPClient(self.cfg.llm)  # SDK 协议错 → 回退 raw
+                        loop = AgentLoop(task, client, tools, root,
+                                         emit=self._emit_for(task.id),
+                                         max_rounds=self.cfg.llm.max_tool_rounds)
+                        self._loops[task.id] = loop
+                    await asyncio.sleep(2 ** attempt)
+            raise last_err
+        except Exception as e:  # noqa: BLE001
+            if task.id not in self._deleted:
+                task.status = TaskState.ERROR
+                task.error = str(e)
+                self.store.save_task(task)
+                full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
+                await self.broadcast(full)
+        finally:
+            if self._sem is not None:
+                self._sem.release()
+            self._loops.pop(task.id, None)
+
+    def _emit_for(self, task_id: str):
+        async def emit(event: dict):
+            # 已删除任务不再追加事件: append_event 的 _dir() 会 mkdir 重建目录
+            if task_id in self._deleted:
+                return
+            full = self.store.append_event(task_id, event)
+            await self.broadcast(full)
+            # 顺带把文本/tool 结果也持久化进消息历史
+            if event["type"] in ("text_delta", "tool_result"):
+                pass  # 消息历史由 AgentLoop 在结束/工具轮时统一写
+        return emit
+
+    async def broadcast(self, event: dict):
+        for q in list(self._subs):
+            q.put_nowait(event)
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self._subs.discard(q)
+
+    def get(self, task_id: str) -> Task:
+        return self.store.get_or_none(task_id)
+
+    def list_tasks(self) -> list[Task]:
+        return self.store.load_tasks()
+
+    def events_since(self, task_id: str, seq: int):
+        return self.store.events_since(task_id, seq)
+
+    def replay_events(self, last_event_id: int) -> list[dict]:
+        """断线补齐: 返回所有任务 seq > last_event_id 的事件,按全局 seq 升序。
+
+        客户端以全局水位(last_event_id)去重,回放流必须全局单调;若按任务逐个
+        回放,跨任务事件会出现全局 seq 倒序,低 seq 事件会被客户端误判为重复而
+        丢弃(补齐丢事件)。回归见 tests/test_manager.py。
+        """
+        replay = []
+        for t in self.list_tasks():
+            replay.extend(self.events_since(t.id, last_event_id))
+        replay.sort(key=lambda ev: ev["seq"])
+        return replay
+
+    async def run_review(self, task_id: str, background: str = ""):
+        task = self.get(task_id)
+        if not task:
+            raise KeyError(task_id)
+        root = task.worktree or task.cwd or "."
+        result = await self.ocr.run_review(root, background=background)
+        self._reviews[task_id] = result
+        return result
+
+    def get_review(self, task_id: str) -> dict:
+        return self._reviews.get(task_id, {"findings": [], "raw": None, "stderr": None})
+
+    async def get_context(self, task_id: str, path: str, line: int, context: int = 8) -> dict:
+        """返回锚点行 ±context 行的文件内容,供 diff 预览展开。
+
+        安全约束: 拒绝绝对路径与 .. 穿越 — 解析后必须仍落在 task 根目录内,
+        越界或读取失败(目录/权限)统一抛 FileNotFoundError → HTTP 404。
+        """
+        task = self.get(task_id)
+        if not task:
+            raise KeyError(task_id)
+        root = Path(task.worktree or task.cwd or ".").resolve()
+        full = Path(path)
+        if full.is_absolute():
+            raise FileNotFoundError("absolute path rejected")
+        full = (root / full).resolve()
+        if not full.is_relative_to(root):
+            raise FileNotFoundError("path escapes task root")
+        try:
+            lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            raise FileNotFoundError(str(full))
+        lo, hi = max(0, line - 1 - context), min(len(lines), line + context)
+        return {"path": str(full), "start": lo + 1, "lines": lines[lo:hi]}
+
+    async def follow_up(self, task_id: str, text: str):
+        task = self.get(task_id)
+        if not task:
+            raise KeyError(task_id)
+        # 任务正在跑(或已在 _loops 注册): 拒绝并发 follow-up,避免同一任务
+        # 双 AgentLoop 并发写历史/重复执行工具(终审 Important 4)。
+        if task.status in (TaskState.RUNNING, TaskState.QUEUED) or task_id in self._loops:
+            return {"status": "busy"}
+        # 已完成/暂停任务: 新建 loop 续聊;worktree 任务 root 必须指向
+        # task.worktree(而非 cwd),与 run_review 一致(终审 Important 6)。
+        client = build_client(self.cfg.llm)
+        root = task.worktree or task.cwd or "."
+        loop = AgentLoop(task, client, self._tools_for(task), root,
+                         emit=self._emit_for(task.id),
+                         max_rounds=self.cfg.llm.max_tool_rounds)
+        self._loops[task_id] = loop
+        asyncio.create_task(self._run_follow(loop, task, text))
+        return {"status": "queued"}
+
+    async def _run_follow(self, loop, task, text):
+        try:
+            await loop.follow_up(text)
+            # 任务可能已被 delete(): 不能 save_task 重建目录
+            if task.id not in self._deleted:
+                self.store.save_task(task)
+        except Exception as e:  # noqa: BLE001 与 _dispatch 一致: 失败落 ERROR 而非静默
+            if task.id not in self._deleted:
+                task.status = TaskState.ERROR
+                task.error = str(e)
+                self.store.save_task(task)
+                full = self.store.append_event(task.id, {"type": "error", "error": str(e)})
+                await self.broadcast(full)
+        finally:
+            self._loops.pop(task.id, None)
+
+    async def stop(self, task_id: str):
+        loop = self._loops.get(task_id)
+        if loop:
+            loop.cancel()
+
+    async def delete(self, task_id: str):
+        if self.get(task_id) is None:
+            raise KeyError(task_id)
+        # 先标记删除再取消循环: 防止仍在跑的 _dispatch/_run_follow 在
+        # rmtree 之后又 save_task,把任务目录"复活"回来。
+        self._deleted.add(task_id)
+        loop = self._loops.get(task_id)
+        if loop:
+            loop.cancel()
+        self.store.delete_task(task_id)
