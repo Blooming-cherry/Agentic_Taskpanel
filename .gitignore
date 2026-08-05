@@ -8,3 +8,4 @@ frontend/dist/
 web/static/
 .pytest_cache/
 .taskpanel/
+.claude/
